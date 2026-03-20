@@ -1,0 +1,40 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026 Guillon Flavien
+
+DEST="/mnt/artefix"
+SRC_DIR=$(pwd)
+
+# Fonction de nettoyage
+cleanup() {
+    echo ""
+    echo "::: Nettoyage de l'environnement Artefix :::"
+    # On démonte dans l'ordre inverse (le plus profond d'abord)
+    # Le flag -l (lazy) est très utile ici pour libérer les points occupés
+    mount | grep "$DEST" | awk '{print $3}' | sort -r | xargs -r sudo umount -l
+    echo "::: Système propre. :::"
+}
+
+# On capture le signal d'interruption pour nettoyer même en cas de crash
+trap cleanup EXIT
+
+echo "::: Préparation du Chroot Artefix :::"
+
+# 1. Montage automatique (on utilise le mnt-stackfs que tu viens de tester)
+sudo ./src/1_artefix.ro/usr/bin/mnt-stackfs \
+     --type bind \
+     --src "$SRC_DIR" \
+     --boot /boot \
+     --target stackfs \
+     --dest "$DEST"
+
+if [ $? -ne 0 ]; then
+    echo "Erreur lors du montage."
+    exit 1
+fi
+
+echo "::: Entrée dans le système (Exit pour quitter) :::"
+# 2. Entrée dans le chroot
+sudo chroot "$DEST" /usr/bin/bash --login
+
+# 3. Le cleanup se déclenche automatiquement à la sortie grâce au 'trap'
