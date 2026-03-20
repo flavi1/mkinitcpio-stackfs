@@ -51,7 +51,7 @@ echo "  > Source: $TARGET_PATH"
 echo "  > Destination: $DEST"
 
 # =========================================================
-# CAS A : FICHIER UNIQUE
+# CAS A : FICHIER UNIQUE (ex: montage d'un .iso ou .img seul)
 # =========================================================
 if [ -f "$TARGET_PATH" ]; then
     mount -o loop "$TARGET_PATH" "$DEST"
@@ -61,7 +61,7 @@ if [ -f "$TARGET_PATH" ]; then
 fi
 
 # =========================================================
-# CAS B : DOSSIER / OVERLAY
+# CAS B : DOSSIER / OVERLAY (La Stack Artefix)
 # =========================================================
 mkdir -p "$DEST"
 mount -t tmpfs -o size=64M tmpfs "$DEST"
@@ -89,7 +89,11 @@ for img in $(ls -1 "$TARGET_PATH" | sort); do
 done
 
 echo "--- Fusion OverlayFS ---"
-all_entries=$(ls -A "${PREMOUNT_MNT}"/* | sed "s|^${PREMOUNT_MNT}/[^/]*/||" | sort -u)
+
+# 1. LISTE D'EXCLUSION : On ignore les points de montage vitaux pour éviter la récursion RO
+EXCLUDE_LIST="^\(\.boot_disk\|\.premount\|tmp\|mnt\|proc\|sys\|dev\|run\|media\)$"
+
+all_entries=$(ls -A "${PREMOUNT_MNT}"/* | sed "s|^${PREMOUNT_MNT}/[^/]*/||" | grep -v "$EXCLUDE_LIST" | sort -u)
 volatiles_queue=""
 
 for entry in $all_entries; do
@@ -98,10 +102,13 @@ for entry in $all_entries; do
     is_rw=false
     count=0
     is_placeholder=false
-    real_dest=$(echo "${DEST}/$entry" | sed 's/__/\//g')
+    
+    # Nettoyage pour éviter les fuites hors de $DEST
+    clean_entry=$(echo "$entry" | sed 's|^/||; s|/$||')
+    real_dest="${DEST}/${clean_entry}"
 
     for mnt in "${PREMOUNT_MNT}"/*; do
-        src="${mnt}/${entry}"
+        src="${mnt}/${clean_entry}"
         if [ -e "$src" ]; then
             if [ -f "$src" ] && [ ! -s "$src" ]; then
                 is_placeholder=true
@@ -115,37 +122,49 @@ for entry in $all_entries; do
         fi
     done
 
+    # Si c'est un placeholder (fichier vide), on le met en file d'attente pour la RAM
     [ "$is_placeholder" = true ] && volatiles_queue="$volatiles_queue $real_dest" && continue
 
     layers=${layers%:}
-    mkdir -p "$(dirname "$real_dest")"
-    mkdir -p "$real_dest"
+    
+    # Sécurisation de l'arborescence sur le tmpfs RW avant montage
+    mkdir -p "$(dirname "$real_dest")" 2>/dev/null
+    [ ! -d "$real_dest" ] && [ ! -f "$real_dest" ] && mkdir -p "$real_dest"
 
     if [ "$count" -eq 1 ]; then
         mount --bind "$last_layer" "$real_dest"
     elif [ "$count" -gt 1 ]; then
         if [ "$is_rw" = true ]; then
-            work_dir="$(dirname "$last_layer")/.work_$(basename "$entry")"
+            # Persistance : Upperdir sur la couche .rw
+            work_dir="$(dirname "$last_layer")/.work_${clean_entry//\//_}"
             mkdir -p "$work_dir"
             lower=${layers#*:}
             mount -t overlay overlay -o lowerdir="$lower",upperdir="$last_layer",workdir="$work_dir" "$real_dest"
         else
-            v_upper="${WORKDIR_BASE}/${entry}_u"
-            v_work="${WORKDIR_BASE}/${entry}_w"
+            # Volatil : Upperdir en RAM
+            v_upper="${WORKDIR_BASE}/${clean_entry//\//_}_u"
+            v_work="${WORKDIR_BASE}/${clean_entry//\//_}_w"
             mkdir -p "$v_upper" "$v_work"
             mount -t overlay overlay -o lowerdir="$layers",upperdir="$v_upper",workdir="$v_work" "$real_dest"
         fi
     fi
 done
 
-# Volatiles
+# --- RÉINITIALISATION DES RÉPERTOIRES STANDARDS ---
+for s in mnt media tmp; do
+    mkdir -p "${DEST}/$s"
+done
+
+# --- GESTION DES VOLATILES (RAM-Only) ---
+echo "--- Initialisation des volumes volatiles ---"
 for vol in $volatiles_queue; do
-    storage="${VOLATILE_BASE}$(echo "$vol" | sed "s|^${DEST}||")"
+    rel_path=$(echo "$vol" | sed "s|^${DEST}||; s|^/||")
+    storage="${VOLATILE_BASE}/${rel_path//\//_}"
     mkdir -p "$storage" "$vol"
     mount --bind "$storage" "$vol"
 done
 
-# Migration des systèmes virtuels
+# --- MIGRATION DES SYSTÈMES VIRTUELS ---
 echo "--- Systèmes virtuels ($TYPE) ---"
 for v in /proc /sys /dev /run; do
     if mountpoint -q "$v"; then
