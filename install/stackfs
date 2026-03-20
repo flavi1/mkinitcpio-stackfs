@@ -1,0 +1,36 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026-present Guillon Flavien
+
+# /usr/lib/initcpio/install/mount_loop
+
+build() {
+    # Utilitaires pour le parsing et l'affichage
+    add_binary /usr/bin/mnt-stackfs
+    add_binary /usr/bin/tr
+    add_binary /usr/bin/tee
+    add_binary /usr/bin/date
+    #add_binary /usr/bin/mount
+    add_binary /usr/bin/ls
+    add_binary /usr/bin/cat
+    add_binary /usr/bin/dirname
+    add_binary /usr/bin/sed
+    add_binary /usr/bin/sort
+    
+    # Indispensable pour le switch final
+    #add_binary /usr/bin/switch_root
+    add_binary /usr/bin/env
+	add_binary /usr/bin/mountpoint
+
+    # Modules noyau nécessaires
+    add_module loop
+    add_module overlay
+    
+    add_runscript
+}
+
+help() {
+    cat <<HELPEOF
+Hook Artefix : Orchestration de couches (Loop/Overlay) avec persistance et journalisation.
+HELPEOF
+}
