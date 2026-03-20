@@ -3,182 +3,39 @@
 # Copyright (C) 2026-present Guillon Flavien
 
 run_hook() {
-    # --- CONFIGURATION ---
-    local BOOT_IMAGE_DEF="/ARTEFIX/boot/vmlinuz-linux"
     local FINAL_ROOT="/new_root"
     local TEMP_DISK="/mnt/boot_disk_temp"
     
-    # 1. Extraction du chemin du kernel
-    local boot_img=$(cat /proc/cmdline | tr ' ' '\n' | sed -n 's/^BOOT_IMAGE=//p')
-    boot_img=${boot_img:-$BOOT_IMAGE_DEF}
-    
-    # 2. Montage temporaire pour analyse
+    # 1. Montage temporaire du disque physique
     local root_dev=$(resolve_device "$root")
     mkdir -p "$TEMP_DISK"
     mount "$root_dev" "$TEMP_DISK"
 
-    # 3. Vérification de l'argument 'mnt'
+    # 2. Résolution dynamique des chemins
+    local boot_img=$(cat /proc/cmdline | tr ' ' '\n' | sed -n 's/^BOOT_IMAGE=//p')
+    local boot_dir=$(dirname "$boot_img")
     local target_name=$(getarg mnt)
-    local base_dir=$(dirname "${TEMP_DISK}${boot_img}")
-    local target_path="${base_dir}/${target_name}"
-
-    # Sécurité : Si mnt est vide ou pointe sur le dossier parent (base_dir)
-    if [ -z "$target_name" ] || [ "$target_path" == "$base_dir" ]; then
-        echo "::: mount_loop : Aucun argument 'mnt' valide. Passage au hook suivant. :::"
-        umount "$TEMP_DISK"
-        return
-    fi
-
-    # 4. Initialisation du LOGGING
-    # On définit le fichier log sur le disque physique
-    local LOG_FILE="${base_dir}/.mount_loop.log"
-    echo "--- Boot Session: $(date) ---" > "$LOG_FILE"
-
-    # Fonction interne pour rediriger tout le flux vers le log + console
-    {
-		echo "::: Artefix : Orchestration des couches (Mode Switch-Root) :::"
-
-		# =========================================================
-		# CAS A : CIBLE UNIQUE (Fichier)
-		# =========================================================
-		if [ -f "$target_path" ]; then
-			echo "  > Cible unique détectée : $(basename "$target_path")"
-			mount -o loop "$target_path" "$FINAL_ROOT"
-			mkdir -p "${FINAL_ROOT}/.boot_disk"
-			mount --move "$TEMP_DISK" "${FINAL_ROOT}/.boot_disk"
-			echo "::: Montage direct terminé :::"
-			return
-		fi
-
-		if [ ! -d "$target_path" ]; then
-			echo "ERREUR : La cible mnt=$target_name est introuvable."
-			return
-		fi
-
-		# =========================================================
-		# CAS B : CIBLE MULTIPLE (Dossier / Overlay)
-		# =========================================================
-		mount -t tmpfs -o size=64M tmpfs "$FINAL_ROOT"
-		mkdir -p "${FINAL_ROOT}/tmp"
-		mount -t tmpfs -o size=50% tmpfs "${FINAL_ROOT}/tmp"
-
-		local BOOT_DISK_MNT="${FINAL_ROOT}/.boot_disk"
-		local PREMOUNT_MNT="${FINAL_ROOT}/.premount"
-		local VOLATILE_BASE="${FINAL_ROOT}/tmp/fs_volatiles"
-		local WORKDIR_BASE="${FINAL_ROOT}/tmp/fs_workdir"
-
-		mkdir -p "$BOOT_DISK_MNT" "$PREMOUNT_MNT" "$VOLATILE_BASE" "$WORKDIR_BASE"
-		mount --move "$TEMP_DISK" "$BOOT_DISK_MNT"
-
-		# Refresh du path suite au move
-		target_path="$(dirname "${BOOT_DISK_MNT}${boot_img}")/${target_name}"
-
-		echo "--- Chargement des volumes (.ro / .rw) ---"
-		local images=$(ls -1 "$target_path" | sort)
-		for img in $images; do
-			local mnt_p="${PREMOUNT_MNT}/$img"
-			mkdir -p "$mnt_p"
-			local opts="loop,ro"
-			[[ "$img" == *.rw ]] && opts="loop,rw"
-			mount -o "$opts" "${target_path}/$img" "$mnt_p"
-		done
-
-		echo "--- Fusion des points d'entrée ---"
-		local all_entries=$(ls -A "${PREMOUNT_MNT}"/* | sed "s|^${PREMOUNT_MNT}/[^/]*/||" | sort -u)
-		local volatiles_queue=""
-
-		for entry in $all_entries; do
-			local layers=""
-			local last_layer=""
-			local is_rw=false
-			local count=0
-			local is_placeholder=false
-			local real_dest=$(echo "${FINAL_ROOT}/$entry" | sed 's/__/\//g')
-
-			for mnt in "${PREMOUNT_MNT}"/*; do
-				local src="${mnt}/${entry}"
-				if [ -e "$src" ]; then
-					if [ -f "$src" ] && [ ! -s "$src" ]; then
-						is_placeholder=true
-					else
-						layers="${src}:${layers}"
-						last_layer="$src"
-						[[ "$(basename "$mnt")" == *.rw ]] && is_rw=true || is_rw=false
-						count=$((count + 1))
-						is_placeholder=false
-					fi
-				fi
-			done
-
-			if [ "$is_placeholder" = true ]; then
-				volatiles_queue="$volatiles_queue $real_dest"
-				continue
-			fi
-
-			layers=${layers%:}
-			mkdir -p "$(dirname "$real_dest")"
-			mkdir -p "$real_dest"
-
-			if [ "$count" -eq 1 ]; then
-				echo "  [BIND] $entry -> $real_dest"
-				mount --bind "$last_layer" "$real_dest"
-			elif [ "$count" -gt 1 ]; then
-				if [ "$is_rw" = true ]; then
-					local work_dir="$(dirname "$last_layer")/.work_$(basename "$entry")"
-					mkdir -p "$work_dir"
-					local lower=${layers#*:}
-					echo "  [OVERLAY-RW] $entry -> $real_dest"
-					mount -t overlay overlay -o lowerdir="$lower",upperdir="$last_layer",workdir="$work_dir" "$real_dest"
-				else
-					local v_upper="${WORKDIR_BASE}/${entry}_u"
-					local v_work="${WORKDIR_BASE}/${entry}_w"
-					mkdir -p "$v_upper" "$v_work"
-					echo "  [OVERLAY-VO] $entry -> $real_dest"
-					mount -t overlay overlay -o lowerdir="$layers",upperdir="$v_upper",workdir="$v_work" "$real_dest"
-				fi
-			fi
-		done
-
-		for vol in $volatiles_queue; do
-			if ! mountpoint -q "$vol"; then
-				echo "  [VOLATILE] -> $vol"
-				local storage="${VOLATILE_BASE}$(echo "$vol" | sed "s|^${FINAL_ROOT}||")"
-				mkdir -p "$storage" "$vol"
-				mount --bind "$storage" "$vol"
-			fi
-		done
-		
-		# --- DÉPLACEMENT DES SYSTÈMES VIRTUELS ---
-		echo "::: Migration des points de montage techniques :::"
-		for mnt in /proc /sys /dev /run /sys/firmware/efi/efivars; do
-			if mountpoint -q "$mnt"; then
-				mkdir -p "${FINAL_ROOT}${mnt}"
-				mount --move "$mnt" "${FINAL_ROOT}${mnt}"
-			fi
-		done
-
-		echo "::: Artefix : Passage au système final :::"
-
-		# 1. Fermer le logging proprement pour libérer les descripteurs
-		# (Le tee s'arrête ici car on sort du bloc de redirection)
-    } 2>&1 | tee -a "$LOG_FILE"
-
-    # 2. Vérification de l'init final
-    if [ ! -x "${FINAL_ROOT}/sbin/init" ]; then
-        echo "ERREUR CRITIQUE : /sbin/init non trouvé ou non exécutable dans ${FINAL_ROOT}"
-        # On ne sort pas, on reste en shell pour débugger
-        launch_interactive_shell
-    else
-		launch_interactive_shell	# DEBUG TO REMOVE !!!!
-    fi
-
-
-    # 3. Arrêt du logger natif d'Artix (si présent)
-    [ -f /usr/bin/rdlogger_stop ] && rdlogger_stop
-
-    # 4. LE GRAND SAUT (Shunt le reste du /init d'Artix)
-    echo "::: Exécution de switch_root vers ${FINAL_ROOT} :::"
     
-    # On vide l'environnement et on saute
+    # 3. APPEL DE L'UTILITAIRE
+    /usr/bin/mnt-stackfs \
+        --type move \
+        --boot "$boot_dir" \
+        --target "$target_name" \
+        --src "$TEMP_DISK" \
+        --dest "$FINAL_ROOT" \
+        --log "${TEMP_DISK}${boot_dir}/.stackfs.log"
+
+    # 4. VERIFICATION ET SAUT
+    if [ ! -x "${FINAL_ROOT}/sbin/init" ]; then
+        echo "ERREUR : /sbin/init non trouvé dans ${FINAL_ROOT}"
+        launch_interactive_shell
+    fi
+
+    # Debug (à supprimer plus tard)
+    launch_interactive_shell
+
+    [ -f /usr/bin/rdlogger_stop ] && rdlogger_stop
+    
+    echo "::: StackFS : Switching root :::"
     exec env -i "TERM=$TERM" /usr/bin/switch_root "$FINAL_ROOT" "/sbin/init"
 }

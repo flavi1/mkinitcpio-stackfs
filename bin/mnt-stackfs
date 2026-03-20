@@ -1,3 +1,157 @@
 #!/usr/bin/bash
 # SPDX-License-Identifier: GPL-2.0-only
-# Copyright (C) 2026 Guillon Flavien - StackFS Project
+# Copyright (C) 2026-present Guillon Flavien
+
+# --- DEFAULTS ---
+TYPE="bind"
+BOOT_DIR="/boot"
+TARGET_NAME="stackfs"
+LOGFILE=""
+DEST="/new_root"
+SRC_MOUNT="" # Le point de montage temporaire du disque physique
+
+usage() {
+    echo "Usage: $0 [options]"
+    echo "Options:"
+    echo "  --type [bind|move]  (default: bind)"
+    echo "  --boot [path]       (default: /boot)"
+    echo "  --target [name]     (default: stackfs)"
+    echo "  --log [path]        (optional)"
+    echo "  --dest [path]       (default: /new_root)"
+    echo "  --src [path]        (Point de montage du disque physique)"
+    exit 1
+}
+
+# Parsing simple
+while [[ "$#" -gt 0 ]]; do
+    case $1 in
+        --type)   TYPE="$2"; shift ;;
+        --boot)   BOOT_DIR="$2"; shift ;;
+        --target) TARGET_NAME="$2"; shift ;;
+        --log)    LOGFILE="$2"; shift ;;
+        --dest)   DEST="$2"; shift ;;
+        --src)    SRC_MOUNT="$2"; shift ;;
+        *) usage ;;
+    esac
+    shift
+done
+
+[ -z "$SRC_MOUNT" ] && echo "Erreur: --src est obligatoire" && exit 1
+
+# Redirection si logfile défini
+if [ -n "$LOGFILE" ]; then
+    exec > >(tee -a "$LOGFILE") 2>&1
+fi
+
+MNT_OP="--$TYPE"
+TARGET_PATH="${SRC_MOUNT}${BOOT_DIR}/${TARGET_NAME}"
+
+echo "::: StackFS Orchestrator ($TYPE) :::"
+echo "  > Source: $TARGET_PATH"
+echo "  > Destination: $DEST"
+
+# =========================================================
+# CAS A : FICHIER UNIQUE
+# =========================================================
+if [ -f "$TARGET_PATH" ]; then
+    mount -o loop "$TARGET_PATH" "$DEST"
+    mkdir -p "${DEST}/.boot_disk"
+    mount "$MNT_OP" "$SRC_MOUNT" "${DEST}/.boot_disk"
+    exit 0
+fi
+
+# =========================================================
+# CAS B : DOSSIER / OVERLAY
+# =========================================================
+mkdir -p "$DEST"
+mount -t tmpfs -o size=64M tmpfs "$DEST"
+mkdir -p "${DEST}/tmp"
+mount -t tmpfs -o size=50% tmpfs "${DEST}/tmp"
+
+BOOT_DISK_MNT="${DEST}/.boot_disk"
+PREMOUNT_MNT="${DEST}/.premount"
+VOLATILE_BASE="${DEST}/tmp/fs_volatiles"
+WORKDIR_BASE="${DEST}/tmp/fs_workdir"
+
+mkdir -p "$BOOT_DISK_MNT" "$PREMOUNT_MNT" "$VOLATILE_BASE" "$WORKDIR_BASE"
+mount "$MNT_OP" "$SRC_MOUNT" "$BOOT_DISK_MNT"
+
+# Refresh path suite au move/bind du disque
+TARGET_PATH="${BOOT_DISK_MNT}${BOOT_DIR}/${TARGET_NAME}"
+
+echo "--- Montage des couches ---"
+for img in $(ls -1 "$TARGET_PATH" | sort); do
+    mnt_p="${PREMOUNT_MNT}/$img"
+    mkdir -p "$mnt_p"
+    opts="loop,ro"
+    [[ "$img" == *.rw ]] && opts="loop,rw"
+    mount -o "$opts" "${TARGET_PATH}/$img" "$mnt_p"
+done
+
+echo "--- Fusion OverlayFS ---"
+all_entries=$(ls -A "${PREMOUNT_MNT}"/* | sed "s|^${PREMOUNT_MNT}/[^/]*/||" | sort -u)
+volatiles_queue=""
+
+for entry in $all_entries; do
+    layers=""
+    last_layer=""
+    is_rw=false
+    count=0
+    is_placeholder=false
+    real_dest=$(echo "${DEST}/$entry" | sed 's/__/\//g')
+
+    for mnt in "${PREMOUNT_MNT}"/*; do
+        src="${mnt}/${entry}"
+        if [ -e "$src" ]; then
+            if [ -f "$src" ] && [ ! -s "$src" ]; then
+                is_placeholder=true
+            else
+                layers="${src}:${layers}"
+                last_layer="$src"
+                [[ "$(basename "$mnt")" == *.rw ]] && is_rw=true || is_rw=false
+                count=$((count + 1))
+                is_placeholder=false
+            fi
+        fi
+    done
+
+    [ "$is_placeholder" = true ] && volatiles_queue="$volatiles_queue $real_dest" && continue
+
+    layers=${layers%:}
+    mkdir -p "$(dirname "$real_dest")"
+    mkdir -p "$real_dest"
+
+    if [ "$count" -eq 1 ]; then
+        mount --bind "$last_layer" "$real_dest"
+    elif [ "$count" -gt 1 ]; then
+        if [ "$is_rw" = true ]; then
+            work_dir="$(dirname "$last_layer")/.work_$(basename "$entry")"
+            mkdir -p "$work_dir"
+            lower=${layers#*:}
+            mount -t overlay overlay -o lowerdir="$lower",upperdir="$last_layer",workdir="$work_dir" "$real_dest"
+        else
+            v_upper="${WORKDIR_BASE}/${entry}_u"
+            v_work="${WORKDIR_BASE}/${entry}_w"
+            mkdir -p "$v_upper" "$v_work"
+            mount -t overlay overlay -o lowerdir="$layers",upperdir="$v_upper",workdir="$v_work" "$real_dest"
+        fi
+    fi
+done
+
+# Volatiles
+for vol in $volatiles_queue; do
+    storage="${VOLATILE_BASE}$(echo "$vol" | sed "s|^${DEST}||")"
+    mkdir -p "$storage" "$vol"
+    mount --bind "$storage" "$vol"
+done
+
+# Migration des systèmes virtuels
+echo "--- Systèmes virtuels ($TYPE) ---"
+for v in /proc /sys /dev /run; do
+    if mountpoint -q "$v"; then
+        mkdir -p "${DEST}${v}"
+        mount "$MNT_OP" "$v" "${DEST}${v}"
+    fi
+done
+
+echo "::: Orchestration terminée :::"
