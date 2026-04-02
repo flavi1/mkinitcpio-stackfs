@@ -91,7 +91,7 @@ done
 echo "--- Fusion OverlayFS ---"
 
 # 1. LISTE D'EXCLUSION : On ignore les points de montage vitaux pour éviter la récursion RO
-EXCLUDE_LIST="^\(\.boot_disk\|\.premount\|tmp\|mnt\|proc\|sys\|dev\|run\|media\)$"
+EXCLUDE_LIST="^\(\.boot_disk\|\.premount\|tmp\|mnt\|proc\|sys\|dev\|run\|media\|boot\)$"
 
 all_entries=$(ls -A "${PREMOUNT_MNT}"/* | sed "s|^${PREMOUNT_MNT}/[^/]*/||" | grep -v "$EXCLUDE_LIST" | sort -u)
 volatiles_queue=""
@@ -172,5 +172,12 @@ for v in /proc /sys /dev /run; do
         mount "$MNT_OP" "$v" "${DEST}${v}"
     fi
 done
+
+# --- GESTION DU BOOT PHYSIQUE ---
+# On lie le /boot du chroot au dossier /boot du disque source (.boot_disk)
+# Cela permet à mkinitcpio de mettre à jour le noyau et l'initramfs réellement.
+echo "--- Liaison du Boot Physique ---"
+mkdir -p "${DEST}/boot"
+mount "$MNT_OP" "${BOOT_DISK_MNT}${BOOT_DIR}" "${DEST}/boot"
 
 echo "::: Orchestration terminée :::"
