@@ -10,7 +10,7 @@ build() {
     add_binary /usr/bin/tr
     add_binary /usr/bin/tee
     add_binary /usr/bin/date
-    #add_binary /usr/bin/mount
+    add_binary /usr/bin/bash
     add_binary /usr/bin/ls
     add_binary /usr/bin/cat
     add_binary /usr/bin/dirname
