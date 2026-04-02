@@ -1,41 +1,57 @@
 #!/usr/bin/bash
-# SPDX-License-Identifier: GPL-2.0-only
-# Copyright (C) 2026-present Guillon Flavien
 
 run_hook() {
     local FINAL_ROOT="/new_root"
     local TEMP_DISK="/mnt/boot_disk_temp"
     
-    # 1. Montage temporaire du disque physique
+    # 1. Extraction des paramètres de la ligne de commande
     local root_dev=$(resolve_device "$root")
-    mkdir -p "$TEMP_DISK"
-    mount "$root_dev" "$TEMP_DISK"
+    # On cherche l'éventuel subvolume (ex: subvol=@)
+    local root_subvol=$(cat /proc/cmdline | tr ' ' '\n' | sed -n 's/^subvol=//p')
+    
+    local mount_opts=""
+    [ -n "$root_subvol" ] && mount_opts="-o subvol=$root_subvol"
 
-    # 2. Résolution dynamique des chemins
+    echo "::: Montage du disque physique ($root_dev) :::"
+    mkdir -p "$TEMP_DISK"
+    mount $mount_opts "$root_dev" "$TEMP_DISK"
+
+    # 2. Résolution des chemins de boot
+    # On récupère BOOT_IMAGE (souvent /@/boot/vmlinuz-linux)
     local boot_img=$(cat /proc/cmdline | tr ' ' '\n' | sed -n 's/^BOOT_IMAGE=//p')
-    local boot_dir=$(dirname "$boot_img")
+    # On nettoie le préfixe du subvolume pour mnt-stackfs
+    # (Si boot_img commence par /@/, on l'enlève pour avoir le chemin relatif au point de montage)
+    local boot_dir=$(dirname "$boot_img" | sed "s|^/${root_subvol}||")
     local target_name=$(getarg mnt)
     
-    # 3. APPEL DE L'UTILITAIRE
-    /usr/bin/mnt-stackfs \
-        --type move \
-        --boot "$boot_dir" \
-        --target "$target_name" \
-        --src "$TEMP_DISK" \
-        --dest "$FINAL_ROOT" \
-        --log "${TEMP_DISK}${boot_dir}/.stackfs.log"
+    [ -z "$target_name" ] && target_name="stackfs"
 
-    # 4. VERIFICATION ET SAUT
-    if [ ! -x "${FINAL_ROOT}/sbin/init" ]; then
-        echo "ERREUR : /sbin/init non trouvé dans ${FINAL_ROOT}"
+    echo "::: Lancement de l'orchestrateur StackFS :::"
+    if [ -f "/usr/bin/mnt-stackfs" ]; then
+        /usr/bin/mnt-stackfs \
+            --type move \
+            --boot "$boot_dir" \
+            --target "$target_name" \
+            --src "$TEMP_DISK" \
+            --dest "$FINAL_ROOT" \
+            --log "${TEMP_DISK}${boot_dir}/.stackfs.log"
+    else
+        echo "ERREUR CRITIQUE : /usr/bin/mnt-stackfs est introuvable dans l'initramfs !"
         launch_interactive_shell
     fi
 
-    # Debug (à supprimer plus tard)
-    launch_interactive_shell
+    # 3. Vérification finale
+    if [ ! -x "${FINAL_ROOT}/sbin/init" ]; then
+        echo "ERREUR : /sbin/init non trouvé dans ${FINAL_ROOT}"
+        echo "Contenu de ${FINAL_ROOT} :"
+        ls -F "${FINAL_ROOT}"
+        launch_interactive_shell
+    fi
 
-    [ -f /usr/bin/rdlogger_stop ] && rdlogger_stop
-    
     echo "::: StackFS : Switching root :::"
+    echo "=> Type exit to switch."
+    launch_interactive_shell
+    
+    # On s'assure que les dossiers vitaux sont prêts pour le switch
     exec env -i "TERM=$TERM" /usr/bin/switch_root "$FINAL_ROOT" "/sbin/init"
 }
