@@ -16,12 +16,18 @@ run_hook() {
     mkdir -p "$TEMP_DISK"
     mount $mount_opts "$root_dev" "$TEMP_DISK"
 
-    # 2. Résolution des chemins de boot
-    # On récupère BOOT_IMAGE (souvent /@/boot/vmlinuz-linux)
-    local boot_img=$(cat /proc/cmdline | tr ' ' '\n' | sed -n 's/^BOOT_IMAGE=//p')
-    # On nettoie le préfixe du subvolume pour mnt-stackfs
-    # (Si boot_img commence par /@/, on l'enlève pour avoir le chemin relatif au point de montage)
-    local boot_dir=$(dirname "$boot_img" | sed "s|^/${root_subvol}||")
+	# 2. Résolution des chemins de boot
+	local boot_img=$(cat /proc/cmdline | tr ' ' '\n' | sed -n 's/^BOOT_IMAGE=//p')
+	local boot_dir_raw=$(dirname "$boot_img")
+
+	# On retire le subvolume du chemin SEULEMENT s'il est présent au début
+	# Exemple : /@/ARTEFIX/boot -> /ARTEFIX/boot
+	local boot_dir="${boot_dir_raw#/$root_subvol}"
+
+	# SECURITE : On s'assure que boot_dir commence TOUJOURS par un seul /
+	# Cela évite le bug "temp@/..."
+	boot_dir="/${boot_dir#/}"
+
     local target_name=$(getarg mnt)
     
     [ -z "$target_name" ] && target_name="stackfs"
