@@ -176,8 +176,8 @@ done
 # --- GESTION DU BOOT PHYSIQUE ---
 # On lie le /boot du chroot au dossier /boot du disque source (.boot_disk)
 # Cela permet à mkinitcpio de mettre à jour le noyau et l'initramfs réellement.
-echo "--- Liaison du Boot Physique ---"
+echo "--- Liaison du Boot Physique (bind) ---"
 mkdir -p "${DEST}/boot"
-mount "$MNT_OP" "${BOOT_DISK_MNT}${BOOT_DIR}" "${DEST}/boot"
+mount --bind "${BOOT_DISK_MNT}${BOOT_DIR}" "${DEST}/boot"
 
 echo "::: Orchestration terminée :::"
