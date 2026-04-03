@@ -109,21 +109,37 @@ for entry in $all_entries; do
 
     for mnt in "${PREMOUNT_MNT}"/*; do
         src="${mnt}/${clean_entry}"
-        if [ -e "$src" ]; then
+        # Utilisation de -e OU -L pour détecter les liens (même si la cible est absente)
+        if [ -e "$src" ] || [ -L "$src" ]; then
             if [ -f "$src" ] && [ ! -s "$src" ]; then
                 is_placeholder=true
             else
                 layers="${src}:${layers}"
                 last_layer="$src"
-                [[ "$(basename "$mnt")" == *.rw ]] && is_rw=true || is_rw=false
+                # Correction du test de la couche RW
+                if [[ "$(basename "$mnt")" == *.rw ]]; then is_rw=true; else is_rw=false; fi
                 count=$((count + 1))
                 is_placeholder=false
             fi
         fi
     done
 
+    # --- ÉTAPE 1 : GESTION DES LIENS SYMBOLIQUES (UsrMerge) ---
+    # Si le dernier état connu de l'entrée est un lien, on le reproduit 
+    # sur le tmpfs au lieu de créer un dossier de montage.
+    if [ -L "$last_layer" ]; then
+        target=$(readlink "$last_layer")
+        echo "  [Link] $clean_entry -> $target"
+        ln -sf "$target" "$real_dest"
+        continue # On passe à l'entrée suivante, pas de montage ici.
+    fi
+
+    # --- ÉTAPE 2 : GESTION DES PLACEHOLDERS ---
     # Si c'est un placeholder (fichier vide), on le met en file d'attente pour la RAM
-    [ "$is_placeholder" = true ] && volatiles_queue="$volatiles_queue $real_dest" && continue
+    if [ "$is_placeholder" = true ]; then
+        volatiles_queue="$volatiles_queue $real_dest"
+        continue
+    fi
 
     layers=${layers%:}
     
