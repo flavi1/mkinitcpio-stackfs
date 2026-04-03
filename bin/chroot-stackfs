@@ -33,6 +33,9 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
+read -n 1 -s -r -p "Appuyez sur une touche pour continuer..."
+echo "" # Pour revenir à la ligne après l'appui
+
 echo "::: Entrée dans le système (Exit pour quitter) :::"
 # 2. Entrée dans le chroot
 sudo chroot "$DEST" /usr/bin/bash --login

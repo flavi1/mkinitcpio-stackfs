@@ -8,7 +8,7 @@ BOOT_DIR="/boot"
 TARGET_NAME="stackfs"
 LOGFILE=""
 DEST="/new_root"
-SRC_MOUNT="" # Le point de montage temporaire du disque physique
+SRC_MOUNT="" 
 
 usage() {
     echo "Usage: $0 [options]"
@@ -22,7 +22,6 @@ usage() {
     exit 1
 }
 
-# Parsing simple
 while [[ "$#" -gt 0 ]]; do
     case $1 in
         --type)   TYPE="$2"; shift ;;
@@ -38,7 +37,6 @@ done
 
 [ -z "$SRC_MOUNT" ] && echo "Erreur: --src est obligatoire" && exit 1
 
-# Redirection si logfile défini
 if [ -n "$LOGFILE" ]; then
     exec > >(tee -a "$LOGFILE") 2>&1
 fi
@@ -47,26 +45,12 @@ MNT_OP="--$TYPE"
 TARGET_PATH="${SRC_MOUNT}${BOOT_DIR}/${TARGET_NAME}"
 
 echo "::: StackFS Orchestrator ($TYPE) :::"
-echo "  > Source: $TARGET_PATH"
-echo "  > Destination: $DEST"
 
 # =========================================================
-# CAS A : FICHIER UNIQUE (ex: montage d'un .iso ou .img seul)
-# =========================================================
-if [ -f "$TARGET_PATH" ]; then
-    mount -o loop "$TARGET_PATH" "$DEST"
-    mkdir -p "${DEST}/.boot_disk"
-    mount "$MNT_OP" "$SRC_MOUNT" "${DEST}/.boot_disk"
-    exit 0
-fi
-
-# =========================================================
-# CAS B : DOSSIER / OVERLAY (La Stack Artefix)
+# INITIALISATION DU TMPFS DESTINATION
 # =========================================================
 mkdir -p "$DEST"
-mount -t tmpfs -o size=64M tmpfs "$DEST"
-mkdir -p "${DEST}/tmp"
-mount -t tmpfs -o size=50% tmpfs "${DEST}/tmp"
+mount -t tmpfs -o size=128M tmpfs "$DEST" # Augmenté à 128M pour plus de flexibilité
 
 BOOT_DISK_MNT="${DEST}/.boot_disk"
 PREMOUNT_MNT="${DEST}/.premount"
@@ -76,7 +60,6 @@ WORKDIR_BASE="${DEST}/tmp/fs_workdir"
 mkdir -p "$BOOT_DISK_MNT" "$PREMOUNT_MNT" "$VOLATILE_BASE" "$WORKDIR_BASE"
 mount "$MNT_OP" "$SRC_MOUNT" "$BOOT_DISK_MNT"
 
-# Refresh path suite au move/bind du disque
 TARGET_PATH="${BOOT_DISK_MNT}${BOOT_DIR}/${TARGET_NAME}"
 
 echo "--- Montage des couches ---"
@@ -90,9 +73,9 @@ done
 
 echo "--- Fusion OverlayFS ---"
 
-# 1. LISTE D'EXCLUSION : On ignore les points de montage vitaux pour éviter la récursion RO
-EXCLUDE_LIST="^\(\.boot_disk\|\.premount\|tmp\|mnt\|proc\|sys\|dev\|run\|media\|boot\)$"
+EXCLUDE_LIST="^\(\.boot_disk\|\.premount\|tmp\|mnt\|proc\|sys\|dev\|run\|media\|boot\|\.workdirs\)$"
 
+# Récupération de toutes les entrées (plates ou normales) présentes dans les couches
 all_entries=$(ls -A "${PREMOUNT_MNT}"/* | sed "s|^${PREMOUNT_MNT}/[^/]*/||" | grep -v "$EXCLUDE_LIST" | sort -u)
 volatiles_queue=""
 
@@ -103,39 +86,44 @@ for entry in $all_entries; do
     count=0
     is_placeholder=false
     
-    # Nettoyage pour éviter les fuites hors de $DEST
     clean_entry=$(echo "$entry" | sed 's|^/||; s|/$||')
-    real_dest="${DEST}/${clean_entry}"
+    
+    # --- MODIFICATION 1 : LOGIQUE DE MAPPING __ VERS / ---
+    # Si l'entrée contient '__', sa destination est transformée (ex: var__log -> var/log)
+    logical_entry="${clean_entry//__//}"
+    real_dest="${DEST}/${logical_entry}"
 
     for mnt in "${PREMOUNT_MNT}"/*; do
-        src="${mnt}/${clean_entry}"
-        # Utilisation de -e OU -L pour détecter les liens (même si la cible est absente)
+        # On doit chercher 'clean_entry' (flat) dans les .rw 
+        # ET 'logical_entry' (standard) dans les .ro (base)
+        if [[ "$(basename "$mnt")" == *.rw ]]; then
+            src="${mnt}/${clean_entry}"
+        else
+            src="${mnt}/${logical_entry}"
+        fi
+
         if [ -e "$src" ] || [ -L "$src" ]; then
             if [ -f "$src" ] && [ ! -s "$src" ]; then
                 is_placeholder=true
             else
                 layers="${src}:${layers}"
                 last_layer="$src"
-                # Correction du test de la couche RW
-                if [[ "$(basename "$mnt")" == *.rw ]]; then is_rw=true; else is_rw=false; fi
+                [[ "$(basename "$mnt")" == *.rw ]] && is_rw=true || is_rw=false
                 count=$((count + 1))
                 is_placeholder=false
             fi
         fi
     done
 
-    # --- ÉTAPE 1 : GESTION DES LIENS SYMBOLIQUES (UsrMerge) ---
-    # Si le dernier état connu de l'entrée est un lien, on le reproduit 
-    # sur le tmpfs au lieu de créer un dossier de montage.
+    # --- ÉTAPE 1 : LIENS SYMBOLIQUES ---
     if [ -L "$last_layer" ]; then
         target=$(readlink "$last_layer")
-        echo "  [Link] $clean_entry -> $target"
+        mkdir -p "$(dirname "$real_dest")"
         ln -sf "$target" "$real_dest"
-        continue # On passe à l'entrée suivante, pas de montage ici.
+        continue
     fi
 
-    # --- ÉTAPE 2 : GESTION DES PLACEHOLDERS ---
-    # Si c'est un placeholder (fichier vide), on le met en file d'attente pour la RAM
+    # --- ÉTAPE 2 : PLACEHOLDERS (RAM) ---
     if [ "$is_placeholder" = true ]; then
         volatiles_queue="$volatiles_queue $real_dest"
         continue
@@ -143,7 +131,6 @@ for entry in $all_entries; do
 
     layers=${layers%:}
     
-    # Sécurisation de l'arborescence sur le tmpfs RW avant montage
     mkdir -p "$(dirname "$real_dest")" 2>/dev/null
     [ ! -d "$real_dest" ] && [ ! -f "$real_dest" ] && mkdir -p "$real_dest"
 
@@ -151,15 +138,18 @@ for entry in $all_entries; do
         mount --bind "$last_layer" "$real_dest"
     elif [ "$count" -gt 1 ]; then
         if [ "$is_rw" = true ]; then
-            # Persistance : Upperdir sur la couche .rw
-            work_dir="$(dirname "$last_layer")/.work_${clean_entry//\//_}"
+            # --- MODIFICATION 2 : WORKDIRS CENTRALISÉS ---
+            # Le workdir est placé dans /.workdirs/ à la racine de la couche RW
+            # On utilise le nom physique (clean_entry) pour éviter les collisions
+            rw_root="$(dirname "$last_layer")"
+            work_dir="${rw_root}/.workdirs/${clean_entry}"
             mkdir -p "$work_dir"
+            
             lower=${layers#*:}
             mount -t overlay overlay -o lowerdir="$lower",upperdir="$last_layer",workdir="$work_dir" "$real_dest"
         else
-            # Volatil : Upperdir en RAM
-            v_upper="${WORKDIR_BASE}/${clean_entry//\//_}_u"
-            v_work="${WORKDIR_BASE}/${clean_entry//\//_}_w"
+            v_upper="${WORKDIR_BASE}/${clean_entry}_u"
+            v_work="${WORKDIR_BASE}/${clean_entry}_w"
             mkdir -p "$v_upper" "$v_work"
             mount -t overlay overlay -o lowerdir="$layers",upperdir="$v_upper",workdir="$v_work" "$real_dest"
         fi
@@ -171,8 +161,7 @@ for s in mnt media tmp; do
     mkdir -p "${DEST}/$s"
 done
 
-# --- GESTION DES VOLATILES (RAM-Only) ---
-echo "--- Initialisation des volumes volatiles ---"
+# --- GESTION DES VOLATILES ---
 for vol in $volatiles_queue; do
     rel_path=$(echo "$vol" | sed "s|^${DEST}||; s|^/||")
     storage="${VOLATILE_BASE}/${rel_path//\//_}"
@@ -180,8 +169,7 @@ for vol in $volatiles_queue; do
     mount --bind "$storage" "$vol"
 done
 
-# --- MIGRATION DES SYSTÈMES VIRTUELS ---
-echo "--- Systèmes virtuels ($TYPE) ---"
+# --- SYSTÈMES VIRTUELS ---
 for v in /proc /sys /dev /run; do
     if mountpoint -q "$v"; then
         mkdir -p "${DEST}${v}"
@@ -189,10 +177,7 @@ for v in /proc /sys /dev /run; do
     fi
 done
 
-# --- GESTION DU BOOT PHYSIQUE ---
-# On lie le /boot du chroot au dossier /boot du disque source (.boot_disk)
-# Cela permet à mkinitcpio de mettre à jour le noyau et l'initramfs réellement.
-echo "--- Liaison du Boot Physique (bind) ---"
+# --- LIAISON DU BOOT PHYSIQUE ---
 mkdir -p "${DEST}/boot"
 mount --bind "${BOOT_DISK_MNT}${BOOT_DIR}" "${DEST}/boot"
 
