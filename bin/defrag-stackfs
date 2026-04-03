@@ -1,0 +1,110 @@
+#!/bin/bash
+# defrag-stackfs - Version corrigée pour StackFS Multi-Overlay
+
+TMP_ROOT="/.boot_disk/@/.tmp_defrag"
+TARGET_BASE="${TMP_ROOT}/new_merged_base"
+TARGET_PERSIST_MNT="${TMP_ROOT}/new_persist_mnt"
+OUTPUT_DIR="/.boot_disk/@/.new"
+
+PERSIST_SIZE="10G"
+EXCLUDES=""
+
+for i in "$@"; do
+    case $i in
+        --exclude=*) EXCLUDES="${i#*=}"; shift ;;
+        --size=*)    PERSIST_SIZE="${i#*=}"; shift ;;
+    esac
+done
+
+# Nettoyage préalable au cas où
+umount "$TARGET_PERSIST_MNT" 2>/dev/null
+rm -rf "$TMP_ROOT"
+mkdir -p "$TARGET_BASE" "$TARGET_PERSIST_MNT" "$OUTPUT_DIR"
+
+# 1. Création de l'image persistance
+PERSIST_IMG="${OUTPUT_DIR}/99_persist.rw"
+echo " > Création de l'image persistance ($PERSIST_SIZE)..."
+truncate -s "$PERSIST_SIZE" "$PERSIST_IMG"
+mkfs.ext4 -F -L "stackfs_persist" "$PERSIST_IMG" >/dev/null 2>&1
+mount -o loop "$PERSIST_IMG" "$TARGET_PERSIST_MNT"
+mkdir -p "$TARGET_PERSIST_MNT/.workdirs"
+
+# 2. Analyse du système (Correction du FIND)
+echo " > Analyse du système... (Recherche des fichiers réels)"
+
+# On liste tout en ignorant les dossiers de l'infrastructure StackFS et les systèmes virtuels
+# On enlève -xdev pour pouvoir traverser les points de montage overlay
+FILES_LIST=$(find / -mindepth 1 \
+    -path "/.boot_disk" -prune -o \
+    -path "/.premount" -prune -o \
+    -path "/new_root" -prune -o \
+    -path "/tmp" -prune -o \
+    -path "/run" -prune -o \
+    -path "/proc" -prune -o \
+    -path "/sys" -prune -o \
+    -path "/dev" -prune -o \
+    -path "/boot" -prune -o \
+    -path "/media" -prune -o \
+    -path "/mnt" -prune -o \
+    -type f -print)
+
+if [ -z "$FILES_LIST" ]; then
+    echo "[-] Erreur critique : Aucun fichier trouvé à migrer."
+    umount "$TARGET_PERSIST_MNT"
+    exit 1
+fi
+
+TOTAL_SIZE=$(echo "$FILES_LIST" | xargs -d '\n' stat -c %s | awk '{s+=$1} END {print s}')
+echo " > Volume détecté : $((TOTAL_SIZE/1024/1024)) MB"
+
+# 3. Transfert
+echo " > Début du transfert..."
+exec 3>&1
+IFS=',' read -ra EXCLUDE_ARRAY <<< "$EXCLUDES"
+
+echo "$FILES_LIST" | while IFS= read -r item; do
+    
+    # Exclusion
+    IGNORED=false
+    for layer in "${EXCLUDE_ARRAY[@]}"; do
+        lp="/.premount/${layer}${item}"
+        if [ -f "$lp" ]; then
+            if [[ $(stat -c %s "$item") -eq $(stat -c %s "$lp") ]] && \
+               [[ $(stat -c %Y "$item") -eq $(stat -c %Y "$lp") ]]; then
+                echo "[Ignoré] $item" >&3
+                IGNORED=true
+                break
+            fi
+        fi
+    done
+
+    [ "$IGNORED" = true ] && continue
+
+    # Destination
+    if [[ "$item" =~ ^/home/ ]] || [[ "$item" =~ ^/root/ ]] || [[ "$item" =~ ^/var/cache/pacman/pkg/ ]] || [[ "$item" =~ ^/var/log/ ]]; then
+        case "$item" in
+            /var/cache/pacman/pkg/*) d="var__cache__pacman__pkg/${item#/var/cache/pacman/pkg/}" ;;
+            /var/log/*) d="var__log/${item#/var/log/}" ;;
+            *) d="${item#/}" ;;
+        esac
+        final_dest="${TARGET_PERSIST_MNT}/${d}"
+    else
+        final_dest="${TARGET_BASE}${item}"
+    fi
+
+    mkdir -p "$(dirname "$final_dest")"
+    cp -a "$item" "$final_dest"
+    
+    # Progress
+    stat -c %s "$item"
+done | pv -s "$TOTAL_SIZE" > /dev/null
+
+exec 3>&-
+
+# 4. Finalisation
+echo -e "\n::: Phase finale :::"
+umount "$TARGET_PERSIST_MNT"
+echo " > Compression de 00_base.ro (XZ)..."
+mksquashfs "$TARGET_BASE" "${OUTPUT_DIR}/00_base.ro" -comp xz -Xbcj x86 -b 1M -noappend
+
+echo "::: TERMINÉ :::"
