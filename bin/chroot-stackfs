@@ -5,22 +5,21 @@
 DEST="/mnt/artefix"
 SRC_DIR=$(pwd)
 
-# Fonction de nettoyage
 cleanup() {
     echo ""
     echo "::: Nettoyage de l'environnement Artefix :::"
-    # On démonte dans l'ordre inverse (le plus profond d'abord)
-    # Le flag -l (lazy) est très utile ici pour libérer les points occupés
+    # On démonte tout ce qui est lié à DEST. 
+    # sort -r permet de démonter les couches overlay avant le tmpfs de base.
     mount | grep "$DEST" | awk '{print $3}' | sort -r | xargs -r sudo umount -l
     echo "::: Système propre. :::"
 }
 
-# On capture le signal d'interruption pour nettoyer même en cas de crash
 trap cleanup EXIT
 
 echo "::: Préparation du Chroot Artefix :::"
 
-# 1. Montage automatique (on utilise le mnt-stackfs que tu viens de tester)
+# 1. Montage via ton orchestrateur
+# Note : mnt-stackfs monte déjà /dev, /proc, /sys, /run et /boot !
 sudo ./src/1_artefix.ro/usr/bin/mnt-stackfs \
      --type bind \
      --src "$SRC_DIR" \
@@ -33,11 +32,16 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
-read -n 1 -s -r -p "Appuyez sur une touche pour continuer..."
-echo "" # Pour revenir à la ligne après l'appui
+# 2. LE PETIT AJOUT : La résolution DNS
+# mnt-stackfs ne gère pas le réseau. Pour pacman, il faut copier le resolv.conf
+if [ -f /etc/resolv.conf ]; then
+    sudo cp /etc/resolv.conf "$DEST/etc/resolv.conf"
+fi
 
 echo "::: Entrée dans le système (Exit pour quitter) :::"
-# 2. Entrée dans le chroot
-sudo chroot "$DEST" /usr/bin/bash --login
 
-# 3. Le cleanup se déclenche automatiquement à la sortie grâce au 'trap'
+# 3. Entrée dans le chroot
+# On force TERM pour avoir les couleurs et une expérience shell propre
+sudo chroot "$DEST" /usr/bin/env TERM="$TERM" /usr/bin/bash --login
+
+# Le cleanup auto s'occupe du reste.
